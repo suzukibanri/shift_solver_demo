@@ -1,0 +1,890 @@
+from __future__ import annotations
+import argparse
+from dataclasses import dataclass
+from typing import List, Dict, Tuple, Optional
+
+import random
+import openpyxl
+from openpyxl.styles import Font, PatternFill
+from ortools.sat.python import cp_model
+
+# ===== Excel スタイル =====
+FILL_GRAY = PatternFill(start_color="FFDDDDDD", end_color="FFDDDDDD", fill_type="solid")
+FONT_RED_BOLD  = Font(bold=True,  color="00FF0000")
+FONT_RED       = Font(bold=False, color="00FF0000")
+FONT_BLUE_BOLD = Font(bold=True,  color="000000C0")
+FONT_BLUE      = Font(bold=False, color="000000C0")
+FONT_BLACK     = Font(bold=False, color="00000000")
+
+# ===== ユーザー設定 =====
+USE_FONT_COLOR_AS_HOLIDAY = False
+SHEET_NAME = "シフト調整"
+
+# ===== シフト種別 =====
+OFF, PAID, TRIP, EARLY, LATE, REG = 0, 1, 2, 3, 4, 5
+SHIFT_TYPES = [OFF, PAID, TRIP, EARLY, LATE, REG]
+
+# ===== 目的関数の重み（ソフト違反コスト） =====
+W_EARLY_PAIR_BAD    = 30
+W_EARLY_FAIRNESS    = 120
+W_TOO_MANY          = 2
+W_TOO_MANY7         = 4
+W_A_EQ2_UNDER       = 5
+W_A_EQ2_OVER        = 2
+W_CONSEC5_EXCESS    = 2000
+W_CONSEC4_EXCESS    = 1800
+W_CARRYIN_AVOID_4   = 500
+
+# グループ平準化・スムージング
+W_GROUP_TARGET_BASE     = 20
+W_GROUP_TARGET_THU_BOOST= 60
+W_GROUP_TARGET_OVER_WEAK= 8
+W_GROUP_SMOOTH_BASE     = 6
+W_GROUP_SMOOTH_THU_NEAR = 14
+
+# 遅人数のターゲット/スムージング
+W_LATE_TARGET_UNDER_THU = 80
+W_LATE_TARGET_OVER_WKD  = 10
+W_LATE_SMOOTH_BASE      = 4
+W_PATTERN_THU3_NEIGHBOR5= 30
+
+TOL_EARLY_FAIRNESS = 0
+
+# ===== 多様解（同コスト別解）生成の設定 =====
+DIVERSIFY_USE_SUM_DISTANCE = True      # True: 過去すべてのプランとの距離合計を最大化
+DIVERSIFY_USE_MIN_DISTANCE = False     # True: 各プランとの差の最小値を最大化（導入には追加モデリングが要るため今回はOFF）
+DIVERSITY_USE_ONLY = {OFF}       # 距離に使うシフト種別（OFF/LATE中心で意味のある差分に）
+DIVERSITY_MIN_DELTA = 10               # 各既存プランとの距離の下限（似すぎ防止）。0なら無効
+RANDOMIZE_SEED_EACH_PLAN = True        # 各プランで探索seedをランダム化（最適性はZ*固定で守られる）
+
+# ===== データ構造 =====
+@dataclass
+class MonthData:
+    days: int
+    dow: List[int]             # 0=Mon .. 6=Sun
+    holiday_like: List[bool]   # True=土曜扱い（祝/振替含む）
+
+@dataclass
+class Staff:
+    idx: int
+    group: str  # 'A' / 'B' / 'C'
+    enabled: bool
+
+# ===== 曜日トークン解釈 =====
+WK_MAP = {
+    "mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6,
+    "月": 0, "火": 1, "水": 2, "木": 3, "金": 4, "土": 5, "日": 6,
+    "1": 0, "2": 1, "3": 2, "4": 3, "5": 4, "6": 5, "7": 6,
+}
+
+def parse_weekday_token(token_raw: Optional[str]) -> Tuple[int, bool]:
+    if token_raw is None or str(token_raw).strip() == "":
+        raise ValueError("E3 行の曜日セルに空白があります。")
+    s = str(token_raw).strip()
+    if s == "祝":
+        return 5, True
+    if "祝" in s:
+        base = s.replace("祝", "").replace("(", "").replace(")", "").strip()
+        base_lower = base.lower()
+        if len(base_lower) >= 3 and base_lower[:3] in WK_MAP:
+            dow = WK_MAP[base_lower[:3]]
+        else:
+            key = base_lower[0]
+            if key not in WK_MAP:
+                raise ValueError(f"曜日トークンが不正です: '{s}'（例: 木/Thu/1）")
+            dow = WK_MAP[key]
+        return dow, True
+    base_lower = s.lower()
+    key = base_lower[:3] if len(base_lower) >= 3 and base_lower[:3] in WK_MAP else s[0]
+    if key.lower() not in WK_MAP and key not in WK_MAP:
+        raise ValueError(f"曜日トークンが不正です: '{s}'（例: 月/Mon/1）")
+    dow = WK_MAP.get(key.lower(), WK_MAP.get(key))
+    return dow, False
+
+# ===== 入力トークン分類 =====
+def classify_token(token: str) -> int:
+    s = str(token).strip()
+    if s in ("有給", "有休"):
+        return PAID
+    if s == "出張":
+        return TRIP
+    if s == "休":
+        return OFF
+    if s == "9" or ("早" in s):
+        return EARLY
+    if s in {"11", "13"} or ("遅" in s):
+        return LATE
+    return REG
+
+# ===== 入力読み取り =====
+def read_input(path: str, sheet_name: str = SHEET_NAME):
+    wb = openpyxl.load_workbook(path)
+    if sheet_name not in wb.sheetnames:
+        raise ValueError(f"Sheet '{sheet_name}' not found")
+    ws = wb[sheet_name]
+
+    rest_quota = int(ws["C2"].value)
+
+    # 日付列
+    day_cols: List[Tuple[int, int]] = []
+    col = 5
+    while True:
+        val = ws.cell(row=2, column=col).value
+        if val is None:
+            break
+        try:
+            dnum = int(str(val).strip())
+            day_cols.append((col, dnum))
+            col += 1
+        except Exception:
+            break
+    D = len(day_cols)
+
+    # 曜日（祝判定）
+    dow, holiday_like = [], []
+    for c, _ in day_cols:
+        token = ws.cell(row=3, column=c).value
+        d, is_hol = parse_weekday_token(token)
+        if USE_FONT_COLOR_AS_HOLIDAY:
+            font_color = ws.cell(row=3, column=c).font.color
+            if font_color is not None:
+                try:
+                    rgb = font_color.rgb
+                    if rgb is not None and rgb.upper() != "FF000000":
+                        is_hol = True
+                except:
+                    pass
+        dow.append(d); holiday_like.append(is_hol)
+    month_info = MonthData(D, dow, holiday_like)
+
+    # スタッフ & 固定 & carry-in(B列)
+    staffs: List[Staff] = []
+    fixed: Dict[Tuple[int, int], str] = {}
+    carry_in: Dict[int, int] = {}
+
+    row = 4
+    consecutive_empty = 0
+    while True:
+        group = ws.cell(row=row, column=4).value  # D列
+        if group in ("A", "B", "C", "休"):
+            enabled = (group != "休")
+            idx = len(staffs)
+            staffs.append(Staff(idx=idx, group=group if enabled else "X", enabled=enabled))
+
+            # B列の持ち込み連勤（0〜4にクリップ）
+            ci_raw = ws.cell(row=row, column=2).value
+            try:
+                ci = int(str(ci_raw).strip()) if ci_raw is not None and str(ci_raw).strip() != "" else 0
+            except Exception:
+                ci = 0
+            ci = max(0, min(ci, 4))
+            carry_in[idx] = ci
+
+            for di, (c, _d) in enumerate(day_cols):
+                val = ws.cell(row=row, column=c).value
+                if val is not None and str(val).strip() != "":
+                    fixed[(idx, di)] = str(val).strip()
+            row += 1
+            consecutive_empty = 0
+        else:
+            if group is None and ws.cell(row=row, column=5).value is None:
+                consecutive_empty += 1
+                if consecutive_empty >= 5:
+                    break
+            else:
+                consecutive_empty = 0
+            row += 1
+
+    return wb, ws, month_info, rest_quota, day_cols, staffs, fixed, carry_in
+
+# ===== 前処理：ユーザ入力のみで「全員出勤日」を抽出 =====
+def compute_allhands_days_user_only(month: MonthData,
+                                    staffs: List[Staff],
+                                    fixed: Dict[Tuple[int, int], str]) -> List[bool]:
+    D = month.days
+    allhands = [False] * D
+    for d in range(D):
+        dow = month.dow[d]
+        is_thu_plain = (dow == 3) and (not month.holiday_like[d])
+        is_sun = (dow == 6)
+        is_sat_or_hol = (dow == 5) or month.holiday_like[d]
+        # 必要人数（曜日別）
+        if is_thu_plain or is_sun:
+            required_total = 5         # 早2 + 遅3 以上
+        elif is_sat_or_hol:
+            required_total = 5         # 遅5 以上
+        else:
+            required_total = 4         # 遅4 以上（木以外の平日）
+        # 潜在出勤可能数 = 固定早/遅の人数 + 空白セル人数（OFF/PAID/TRIPは除外）
+        potential = 0
+        for i, s in enumerate(staffs):
+            if not s.enabled:
+                continue
+            tok = fixed.get((i, d))
+            if tok is None or str(tok).strip() == "":
+                potential += 1
+            else:
+                k = classify_token(tok)
+                if k in (EARLY, LATE):
+                    potential += 1
+        allhands[d] = (potential < required_total)
+
+    print("\n[Precheck] All-Hands days (user-only basis):",
+          ",".join(str(d+1) for d in range(D) if allhands[d]) or "(none)")
+    return allhands
+
+# ===== デバッグ表示 =====
+def debug_day_snapshot(month: MonthData, staffs: List[Staff], fixed: Dict[Tuple[int,int], str]):
+    enabled_idx = [i for i,s in enumerate(staffs) if s.enabled]
+    print("---- Quick day snapshot (enabled counts & fixed notes) ----")
+    for d in range(month.days):
+        tag = []
+        if (month.dow[d] == 3 and not month.holiday_like[d]) or (month.dow[d] == 6):
+            tag.append("TS")
+        if month.holiday_like[d]:
+            tag.append("HOL")
+        gA = sum(1 for i in enabled_idx if staffs[i].group == "A")
+        gB = sum(1 for i in enabled_idx if staffs[i].group == "B")
+        gC = sum(1 for i in enabled_idx if staffs[i].group == "C")
+        fixed_early = [i for (i,dd),tok in fixed.items() if dd==d and classify_token(tok)==EARLY]
+        fixed_late  = [i for (i,dd),tok in fixed.items() if dd==d and classify_token(tok)==LATE]
+        fixed_off   = [i for (i,dd),tok in fixed.items() if dd==d and classify_token(tok)==OFF]
+        print(f"Day {d+1:02d} [{' '.join(tag) or '-'}]  A:{gA} B:{gB} C:{gC} | fixed 9:{len(fixed_early)} 13/11:{len(fixed_late)} OFF:{len(fixed_off)}")
+
+# ===== モデル =====
+class ShiftModel:
+    def __init__(self, month: MonthData, staffs: List[Staff], rest_quota: int,
+                 fixed: Dict[Tuple[int,int], str], carry_in: Dict[int, int],
+                 allhands_days: List[bool]):
+        self.m = cp_model.CpModel()
+        self.month = month
+        self.staffs = staffs
+        self.N = len(staffs)
+        self.D = month.days
+        self.rest_quota = rest_quota
+        self.fixed_tokens = fixed
+        self.carry_in = carry_in
+        self.allhands_days = allhands_days
+
+        self.x = {(i, d, k): self.m.NewBoolVar(f"x_{i}_{d}_{k}")
+                  for i in range(self.N) for d in range(self.D) for k in SHIFT_TYPES}
+
+        self.paid_fixed = {(i, d) for (i, d), tok in self.fixed_tokens.items() if classify_token(tok) == PAID}
+        self.trip_fixed = {(i, d) for (i, d), tok in self.fixed_tokens.items() if classify_token(tok) == TRIP}
+        self.off_fixed  = {(i, d) for (i, d), tok in self.fixed_tokens.items() if classify_token(tok) == OFF}
+
+        # 後段（多様化）で使うため、目的関数の“合計ペナルティ”をVarとして保持
+        # （Z == sum(penalties) をモデル内に作る）
+        self.obj_penalties: List[cp_model.IntVar | cp_model.BoolVar] = []
+        self.obj_var: Optional[cp_model.IntVar] = None  # Z = Σpenalties
+
+    def is_enabled(self, i: int) -> bool: return self.staffs[i].enabled
+    def is_thu_plain(self, d: int) -> bool: return (self.month.dow[d] == 3) and (not self.month.holiday_like[d])
+    def is_sun(self, d: int) -> bool: return self.month.dow[d] == 6
+    def is_sat_or_hol(self, d: int) -> bool: return (self.month.dow[d] == 5) or self.month.holiday_like[d]
+    def on_site(self, i: int, d: int): return [self.x[(i, d, EARLY)], self.x[(i, d, LATE)], self.x[(i, d, REG)]]
+    def works(self, i: int, d: int): return self.on_site(i, d) + [self.x[(i, d, TRIP)]]
+
+    def add_base_constraints(self):
+        m = self.m
+        # 1-of-K / PAID・TRIPは固定のみ / 未固定はREG禁止
+        for i in range(self.N):
+            if not self.is_enabled(i):
+                for d in range(self.D):
+                    m.Add(self.x[(i, d, OFF)] == 1)
+                    for k in SHIFT_TYPES:
+                        if k != OFF: m.Add(self.x[(i, d, k)] == 0)
+                continue
+            for d in range(self.D):
+                m.Add(sum(self.x[(i, d, k)] for k in SHIFT_TYPES) == 1)
+                if (i, d) not in self.paid_fixed: m.Add(self.x[(i, d, PAID)] == 0)
+                if (i, d) not in self.trip_fixed: m.Add(self.x[(i, d, TRIP)] == 0)
+                if (i, d) not in self.fixed_tokens: m.Add(self.x[(i, d, REG)] == 0)
+
+        # 固定セルの強制
+        for (i, d), tok in self.fixed_tokens.items():
+            k = classify_token(tok)
+            self.m.Add(self.x[(i, d, k)] == 1)
+
+        # 前処理 All-Hands：未固定OFF禁止
+        for d in range(self.D):
+            if not self.allhands_days[d]:
+                continue
+            for i in range(self.N):
+                if not self.is_enabled(i): continue
+                if (i, d) in self.fixed_tokens: continue
+                self.m.Add(self.x[(i, d, OFF)] == 0)
+
+    def add_constraints_and_objective(self):
+        m = self.m
+        penalties: List[cp_model.IntVar | cp_model.BoolVar] = []
+
+        # ---- TS：日/木(祝でない) 早は2人ちょうど（ハード）----
+        for d in range(self.D):
+            is_ts = self.is_sun(d) or self.is_thu_plain(d)
+            if not is_ts: continue
+            early_cnt = sum(self.x[(i, d, EARLY)] for i in range(self.N) if self.is_enabled(i))
+            m.Add(early_cnt == 2)
+
+        # TS以外の日は早番を完全禁止（ハード）
+        for d in range(self.D):
+            if not (self.is_sun(d) or self.is_thu_plain(d)):
+                for i in range(self.N):
+                    if self.is_enabled(i):
+                        m.Add(self.x[(i, d, EARLY)] == 0)
+
+        # ---- TS の遅 構成ハード ----
+        for d in range(self.D):
+            if self.is_sun(d):
+                a_late = sum(self.x[(i, d, LATE)] for i in range(self.N)
+                             if self.is_enabled(i) and self.staffs[i].group == "A")
+                m.Add(a_late >= 1)      # 日曜：Aの遅 ≥ 1
+            if self.is_thu_plain(d):
+                ab_late = sum(self.x[(i, d, LATE)] for i in range(self.N)
+                              if self.is_enabled(i) and self.staffs[i].group in ("A","B"))
+                m.Add(ab_late >= 2)     # 木：A+Bの遅 ≥ 2
+
+        # ---- 遅の下限（ハード）----
+        for d in range(self.D):
+            late_cnt = sum(self.x[(i, d, LATE)] for i in range(self.N) if self.is_enabled(i))
+            if self.is_sat_or_hol(d):
+                m.Add(late_cnt >= 5)      # 土/祝
+            elif self.is_thu_plain(d) or self.is_sun(d):
+                m.Add(late_cnt >= 3)      # 木/日
+            else:
+                m.Add(late_cnt >= 4)      # 木以外平日
+
+        # ---- 木曜（祝でない）の早番：前日OFF or 固定PAID（ハード）----
+        for d in range(self.D):
+            if not self.is_thu_plain(d):
+                continue
+            if d - 1 >= 0:
+                for i in range(self.N):
+                    if not self.is_enabled(i): continue
+                    if (i, d-1) in self.paid_fixed:
+                        continue
+                    m.Add(self.x[(i, d, EARLY)] <= self.x[(i, d-1, OFF)])
+            else:
+                for i in range(self.N):
+                    if not self.is_enabled(i): continue
+                    m.Add(self.x[(i, d, EARLY)] == 0)
+
+        # ---- A在勤 ≥1（ハード）＋「だいたい2人」（ソフト）----
+        for d in range(self.D):
+            a_on = sum(sum(self.on_site(i, d)) for i in range(self.N)
+                       if self.is_enabled(i) and self.staffs[i].group == "A")
+            m.Add(a_on >= 1)
+            over  = self.m.NewIntVar(0, self.N, f"a_over_{d}")
+            under = self.m.NewIntVar(0, self.N, f"a_under_{d}")
+            m.Add(over  >= a_on - 2)
+            m.Add(under >= 2 - a_on)
+            penalties.append(W_A_EQ2_OVER * over + W_A_EQ2_UNDER * under)
+
+        # ---- AB在勤 ≥3（ハード）----
+        for d in range(self.D):
+            ab_on = sum(sum(self.on_site(i, d)) for i in range(self.N)
+                        if self.is_enabled(i) and self.staffs[i].group in ("A","B"))
+            m.Add(ab_on >= 3)
+
+        # ---- 公休==C2（ハード）----
+        for i in range(self.N):
+            if not self.is_enabled(i): continue
+            off_count = self.m.NewIntVar(0, self.D, f"offcnt_{i}")
+            m.Add(off_count == sum(self.x[(i, d, OFF)] for d in range(self.D)))
+            m.Add(off_count == self.rest_quota)
+
+
+        # ---- システムOFFで3連休を作らない（ユーザ固定のみなら許可：ハード）----
+        for i in range(self.N):
+            if not self.is_enabled(i): continue
+            for start in range(self.D - 3 + 1):
+                off3 = [self.x[(i, d, OFF)] for d in range(start, start+3)]
+                all3 = self.m.NewBoolVar(f"all3off_{i}_{start}")
+                m.Add(sum(off3) == 3).OnlyEnforceIf(all3)
+                m.Add(sum(off3) != 3).OnlyEnforceIf(all3.Not())
+                sys_off_vars = []
+                for d in range(start, start+3):
+                    if (i, d) in self.off_fixed:
+                        continue
+                    sys_off_vars.append(self.x[(i, d, OFF)])
+                if sys_off_vars:
+                    m.Add(sum(sys_off_vars) == 0).OnlyEnforceIf(all3)
+
+                # ---- 休-休間ベースの連勤制約（ハード）＆ 4連勤ソフト ----
+        # 連勤の「状態」を明示的に持つ（開始時=carry-in）。b[i,d,r]: 日dの開始時点で連勤長r (r=0..4)
+        # day d の開始とは「d日の勤務/休みを決める直前」の状態。
+        b = {}
+        for i in range(self.N):
+            if not self.is_enabled(i): 
+                continue
+            for d in range(self.D + 1):
+                for r in range(5):  # 0..4
+                    b[(i, d, r)] = self.m.NewBoolVar(f"b_{i}_{d}_{r}")
+
+        # 1) 各日の状態は one-hot
+        for i in range(self.N):
+            if not self.is_enabled(i): 
+                continue
+            # d=0 は carry-in で固定
+            ci = int(self.carry_in.get(i, 0))
+            m.Add(sum(b[(i, 0, r)] for r in range(5)) == 1)
+            for r in range(5):
+                m.Add(b[(i, 0, r)] == (1 if r == ci else 0))
+            # d=1..D も one-hot
+            for d in range(1, self.D + 1):
+                m.Add(sum(b[(i, d, r)] for r in range(5)) == 1)
+
+        # 2) 勤務/休みのブールを作る（worksは 0/1 の合計）
+        work_b = {}
+        for i in range(self.N):
+            if not self.is_enabled(i): 
+                continue
+            for d in range(self.D):
+                work_sum = self.m.NewIntVar(0, 1, f"worksum_{i}_{d}")
+                m.Add(work_sum == sum(self.works(i, d)))
+                wb = self.m.NewBoolVar(f"workb_{i}_{d}")
+                m.Add(work_sum == 1).OnlyEnforceIf(wb)
+                m.Add(work_sum == 0).OnlyEnforceIf(wb.Not())
+                work_b[(i, d)] = wb
+
+        # 3) 遷移：OFFなら次の状態は0、WORKなら r->r+1（r=0..3）。r=4 でのWORKは不可（=必ずOFF）
+        for i in range(self.N):
+            if not self.is_enabled(i): 
+                continue
+            for d in range(self.D):
+                off = self.x[(i, d, OFF)]
+                wb  = work_b[(i, d)]
+                # OFF のとき、翌日の連勤長は必ず0
+                m.Add(b[(i, d+1, 0)] == 1).OnlyEnforceIf(off)
+                # WORK & r=0..3 -> 翌日は r+1
+                for r in range(4):
+                    m.Add(b[(i, d+1, r+1)] == 1).OnlyEnforceIf([wb, b[(i, d, r)]])
+                # r=4 のとき WORK は禁止（=ハード：休-休間 ≤4）
+                m.Add(wb == 0).OnlyEnforceIf(b[(i, d, 4)])
+
+        # 4) ソフト：4連勤をできれば避ける（r=3 から WORK で 4 になる瞬間にペナルティ）
+        #    「4日働いた状態を作る」イベントを1回だけカウントするので、窓の重複がありません。
+        for i in range(self.N):
+            if not self.is_enabled(i):
+                continue
+            for d in range(self.D):
+                is_fourth = self.m.NewBoolVar(f"is4th_{i}_{d}")
+                # is_fourth <=> (開始時r=3 かつ その日WORK)
+                m.AddBoolAnd([b[(i, d, 3)], work_b[(i, d)]]).OnlyEnforceIf(is_fourth)
+                m.AddBoolOr([b[(i, d, 3)].Not(), work_b[(i, d)].Not()]).OnlyEnforceIf(is_fourth.Not())
+                penalties.append(W_CONSEC4_EXCESS * is_fourth)
+
+
+        # ---- carry-in 高い人の初日勤務を軽く抑制（ソフト）----
+        for i in range(self.N):
+            if not self.is_enabled(i): continue
+            if int(self.carry_in.get(i, 0)) >= 3 and self.D >= 1:
+                penalties.append(W_CARRYIN_AVOID_4 * sum(self.works(i, 0)))
+
+        # ---- 早番ペア相性（ソフト）----
+        allowed = {("A","B"),("B","A"),("A","C"),("C","A"),("B","C"),("C","B"),("B","B")}
+        for d in range(self.D):
+            if not (self.is_sun(d) or self.is_thu_plain(d)): continue
+            for i in range(self.N):
+                for j in range(i+1, self.N):
+                    if not (self.is_enabled(i) and self.is_enabled(j)):
+                        continue
+                    pair_bad = (self.staffs[i].group, self.staffs[j].group) not in allowed
+                    if pair_bad:
+                        v = self.m.NewBoolVar(f"badpair_{i}_{j}_{d}")
+                        m.Add(self.x[(i, d, EARLY)] + self.x[(j, d, EARLY)] <= 1 + v)
+                        penalties.append(W_EARLY_PAIR_BAD * v)
+
+        # ---- 早番配分の公平性---
+        # ---- 早番配分：回数の範囲をハードで締める（max-min ≤ 1）＋従来のソフト ----
+        active_idx = [i for i, s in enumerate(self.staffs) if s.enabled]
+
+        def is_TS(d):  # 早が出現し得る日（木(祝でない)・日）
+            return self.is_sun(d) or self.is_thu_plain(d)
+
+        # 各人の早番回数 ec[i]
+        ec_vars: Dict[int, cp_model.IntVar] = {}
+        total_early = sum(2 for d in range(self.D) if is_TS(d))  # TS日は早=2人ちょうど
+        M = max(1, len(active_idx))
+        q = total_early // M
+        TOL = TOL_EARLY_FAIRNESS
+
+        for i in active_idx:
+            ec_i = self.m.NewIntVar(0, self.D, f"ec_{i}")
+            m.Add(ec_i == sum(self.x[(i, d, EARLY)] for d in range(self.D) if is_TS(d)))
+            ec_vars[i] = ec_i
+
+            # （任意）従来の「平均からのズレ」ソフトは残す：微調整用
+            over  = self.m.NewIntVar(0, self.D, f"ec_over_{i}")
+            under = self.m.NewIntVar(0, self.D, f"ec_under_{i}")
+            m.Add(over  >= ec_i - (q + TOL))
+            m.Add(under >= (q - TOL) - ec_i)
+            penalties.append(W_EARLY_FAIRNESS * (over + under))
+
+        # ★ハード制約：最大回数 − 最小回数 ≤ 1 を必ず満たす
+        #   方法A（簡潔）：全ペア |ec[i]-ec[j]| ≤ 1
+        idx_list = list(ec_vars.keys())
+        for a in range(len(idx_list)):
+            for b in range(a + 1, len(idx_list)):
+                i, j = idx_list[a], idx_list[b]
+                m.Add(ec_vars[i] - ec_vars[j] <= 1)
+                m.Add(ec_vars[j] - ec_vars[i] <= 1)
+
+        # 方法B（代替）：max/min 変数を使う版（必要ならこちらに切替）
+        # maxE = self.m.NewIntVar(0, self.D, "max_early")
+        # minE = self.m.NewIntVar(0, self.D, "min_early")
+        # m.AddMaxEquality(maxE, [ec_vars[i] for i in idx_list])
+        # m.AddMinEquality(minE, [ec_vars[i] for i in idx_list])
+        # m.Add(maxE - minE <= 1)
+        # penalties.append(W_EARLY_FAIRNESS * (maxE - minE))  # ソフトを補助に使うなら
+
+
+        # =====================================================================
+        # A/B/Cのばらつき抑制・スムージング・遅人数の誘導（ソフト）
+        # =====================================================================
+        A_on = []
+        B_on = []
+        C_on = []
+        for d in range(self.D):
+            A_on.append(sum(sum(self.on_site(i, d)) for i in range(self.N)
+                            if self.is_enabled(i) and self.staffs[i].group == 'A'))
+            B_on.append(sum(sum(self.on_site(i, d)) for i in range(self.N)
+                            if self.is_enabled(i) and self.staffs[i].group == 'B'))
+            C_on.append(sum(sum(self.on_site(i, d)) for i in range(self.N)
+                            if self.is_enabled(i) and self.staffs[i].group == 'C'))
+
+        LATE_cnt = [sum(self.x[(i, d, LATE)] for i in range(self.N) if self.is_enabled(i))
+                    for d in range(self.D)]
+
+        # 1) グループ目標人数（平日 A=2,B=2,C=1 / 土日祝 C=2 寄り）
+        for d in range(self.D):
+            is_thu = self.is_thu_plain(d)
+            is_sun = self.is_sun(d)
+            is_sat_hol = self.is_sat_or_hol(d)
+            A_tgt = 2
+            B_tgt = 2
+            C_tgt = 2 if (is_sat_hol or is_sun) else 1
+
+            for name, on, tgt in (('A', A_on[d], A_tgt),
+                                  ('B', B_on[d], B_tgt),
+                                  ('C', C_on[d], C_tgt)):
+                over = self.m.NewIntVar(0, self.N, f"{name}_over_d{d}")
+                under = self.m.NewIntVar(0, self.N, f"{name}_under_d{d}")
+                m.Add(over  >= on - tgt)
+                m.Add(under >= tgt - on)
+                if is_thu and name in ('A', 'B'):
+                    penalties.append(W_GROUP_TARGET_THU_BOOST * under + W_GROUP_TARGET_OVER_WEAK * over)
+                else:
+                    if (not is_thu) and (not is_sat_hol) and (not is_sun):
+                        penalties.append(W_GROUP_TARGET_BASE * under + W_GROUP_TARGET_OVER_WEAK * over)
+                    else:
+                        penalties.append(W_GROUP_TARGET_BASE * (under + over))
+
+        # 2) 隣接日のスムージング（A/B/C）
+        for d in range(self.D - 1):
+            is_wed_thu = (self.month.dow[d] == 2 and self.is_thu_plain(d+1))
+            is_thu_fri = (self.is_thu_plain(d) and self.month.dow[d+1] == 4)
+            for name, seq in (('A', A_on), ('B', B_on), ('C', C_on)):
+                diff = self.m.NewIntVar(0, self.N, f"{name}_smooth_d{d}")
+                m.Add(diff >= seq[d] - seq[d+1])
+                m.Add(diff >= seq[d+1] - seq[d])
+                w = W_GROUP_SMOOTH_THU_NEAR if (is_wed_thu or is_thu_fri) else W_GROUP_SMOOTH_BASE
+                penalties.append(w * diff)
+
+        # 3) 遅人数ターゲット
+        for d in range(self.D):
+            is_thu = self.is_thu_plain(d)
+            is_sun = self.is_sun(d)
+            is_sat_hol = self.is_sat_or_hol(d)
+            late = LATE_cnt[d]
+            if is_sat_hol:
+                pass
+            elif is_sun:
+                pass
+            elif is_thu:
+                under_to4 = self.m.NewIntVar(0, 4, f"late_under4_thu_d{d}")
+                m.Add(under_to4 >= 4 - late)
+                penalties.append(W_LATE_TARGET_UNDER_THU * under_to4)
+            else:
+                over4 = self.m.NewIntVar(0, 10, f"late_over4_wkd_d{d}")
+                m.Add(over4 >= late - 4)
+                penalties.append(W_LATE_TARGET_OVER_WKD * over4)
+
+        # 4) 遅人数の隣接スムージング
+        for d in range(self.D - 1):
+            diff_late = self.m.NewIntVar(0, 10, f"late_smooth_d{d}")
+            m.Add(diff_late >= LATE_cnt[d]   - LATE_cnt[d+1])
+            m.Add(diff_late >= LATE_cnt[d+1] - LATE_cnt[d])
+            penalties.append(W_LATE_SMOOTH_BASE * diff_late)
+
+        # 5) パターン検知：木=3 & 隣接平日=5+ を嫌う
+        for d in range(self.D):
+            if not self.is_thu_plain(d):
+                continue
+            late_ge3 = self.m.NewBoolVar(f"thu_d{d}_late_ge3")
+            late_ge4 = self.m.NewBoolVar(f"thu_d{d}_late_ge4")
+            m.Add(LATE_cnt[d] >= 3).OnlyEnforceIf(late_ge3)
+            m.Add(LATE_cnt[d] <  3).OnlyEnforceIf(late_ge3.Not())
+            m.Add(LATE_cnt[d] >= 4).OnlyEnforceIf(late_ge4)
+            m.Add(LATE_cnt[d] <  4).OnlyEnforceIf(late_ge4.Not())
+            eq3 = self.m.NewBoolVar(f"thu_d{d}_late_eq3")
+            m.AddBoolAnd([late_ge3, late_ge4.Not()]).OnlyEnforceIf(eq3)
+            m.AddBoolOr([late_ge3.Not(), late_ge4]).OnlyEnforceIf(eq3.Not())
+
+            neighbors = []
+            if d-1 >= 0:
+                is_prev_plain_wkd = (not self.is_thu_plain(d-1)) and (not self.is_sat_or_hol(d-1)) and (not self.is_sun(d-1))
+                if is_prev_plain_wkd:
+                    prev_ge5 = self.m.NewBoolVar(f"prev_d{d}_late_ge5")
+                    m.Add(LATE_cnt[d-1] >= 5).OnlyEnforceIf(prev_ge5)
+                    m.Add(LATE_cnt[d-1] <  5).OnlyEnforceIf(prev_ge5.Not())
+                    neighbors.append(prev_ge5)
+            if d+1 < self.D:
+                is_next_plain_wkd = (not self.is_thu_plain(d+1)) and (not self.is_sat_or_hol(d+1)) and (not self.is_sun(d+1))
+                if is_next_plain_wkd:
+                    next_ge5 = self.m.NewBoolVar(f"next_d{d}_late_ge5")
+                    m.Add(LATE_cnt[d+1] >= 5).OnlyEnforceIf(next_ge5)
+                    m.Add(LATE_cnt[d+1] <  5).OnlyEnforceIf(next_ge5.Not())
+                    neighbors.append(next_ge5)
+
+            if neighbors:
+                nb_or = self.m.NewBoolVar(f"thu_d{d}_neighbor5plus")
+                m.AddBoolOr(neighbors).OnlyEnforceIf(nb_or)
+                trigger = self.m.NewBoolVar(f"thu_d{d}_eq3_and_nb5")
+                m.AddBoolAnd([eq3, nb_or]).OnlyEnforceIf(trigger)
+                m.AddBoolOr([eq3.Not(), nb_or.Not()]).OnlyEnforceIf(trigger.Not())
+                penalties.append(W_PATTERN_THU3_NEIGHBOR5 * trigger)
+
+        # ---- 出勤人数の上振れ（軽ソフト）----
+        for d in range(self.D):
+            onsite = sum(sum(self.on_site(i, d)) for i in range(self.N) if self.is_enabled(i))
+            target = 6 if self.is_sun(d) else 5
+            excess = self.m.NewIntVar(0, 10, f"excess_{d}")
+            m.Add(excess >= onsite - target)
+            penalties.append(W_TOO_MANY * excess)
+            excess7 = self.m.NewIntVar(0, 10, f"excess7_{d}")
+            m.Add(excess7 >= onsite - 7)
+            penalties.append(W_TOO_MANY7 * excess7)
+
+        # ---- 目的関数：Z = Σpenalties として保持 ----
+        # すべて整数なので上界はおおきめに取る
+        Z_ub = 10**9
+        Z = self.m.NewIntVar(0, Z_ub, "Z")
+        # penalties は IntVar/BoolVar の線形和
+        m.Add(Z == sum(penalties))
+        self.m.Minimize(Z)
+
+        # 後段の多様化で使うため保存
+        self.obj_penalties = penalties
+        self.obj_var = Z
+
+    # --- 多様化のための補助：目的値を固定し、距離を最大化する目的に差し替え ---
+    def add_objective_diversify_with_fixed_cost(self,
+                                                best_obj_value: int,
+                                                previous_plans: List[Dict[Tuple[int,int,int], int]],
+                                                min_delta: int = 0):
+        assert self.obj_var is not None, "Call add_constraints_and_objective() first."
+        # 1) 目的値を固定（最適性維持）
+        self.m.Add(self.obj_var == int(best_obj_value))
+
+        # 2) 距離（OFF/LATE）を最大化
+        #    dist_t = Σ_{(i,d,k∈DIVERSITY_USE_ONLY)} |x - s_t|
+        #    |x - s| = x (if s=0) or (1 - x) (if s=1)
+        all_dist_terms: List[cp_model.IntVar | cp_model.LinearExpr] = []
+        for t, sol in enumerate(previous_plans):
+            # 個別の距離
+            dist_terms_t = []
+            for (i, d, k), var in self.x.items():
+                if k not in DIVERSITY_USE_ONLY:
+                    continue
+                s = sol.get((i, d, k), 0)  # 0/1
+                if s == 1:
+                    # contribute (1 - x)
+                    dist_terms_t.append(1 - var)
+                else:
+                    # contribute x
+                    dist_terms_t.append(var)
+            if dist_terms_t:
+                # dist_t は線形式（合計個数は上限 N*D*|Ksel|）
+                dist_t = sum(dist_terms_t)
+                all_dist_terms.append(dist_t)
+                # 似すぎ防止の下限
+                if min_delta and min_delta > 0:
+                    # dist_t >= min_delta
+                    self.m.Add(dist_t >= min_delta)
+
+        if not all_dist_terms:
+            # 比較対象がない（=プラン1）場合は何もしない
+            return
+
+        # 合計距離を最大化 → 負で最小化に変換
+        total_distance = sum(all_dist_terms)  # LinearExpr
+        # CP-SATはMinimizeのみなので、-total_distance を最小化 ＝ total_distance最大化
+        self.m.Minimize(-total_distance)
+
+    # --- ソルブ ---
+    def solve(self, max_time: int = 15, random_seed: Optional[int] = None):
+        solver = cp_model.CpSolver()
+        solver.parameters.max_time_in_seconds = float(max_time)
+        solver.parameters.num_search_workers = 8
+        if random_seed is not None:
+            solver.parameters.random_seed = random_seed
+
+        status = solver.Solve(self.m)
+        assignment = [[None for _ in range(self.D)] for _ in range(self.N)]
+
+        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            for i in range(self.N):
+                for d in range(self.D):
+                    for k in SHIFT_TYPES:
+                        if solver.Value(self.x[(i, d, k)]) == 1:
+                            assignment[i][d] = k
+                            break
+        return status, assignment, (solver.ObjectiveValue() if self.obj_var is not None else None)
+
+# ===== 出力 =====
+def write_plan_sheet(
+    wb: openpyxl.Workbook,
+    template_ws: openpyxl.worksheet.worksheet.Worksheet,
+    sheet_name: str,
+    month: MonthData,
+    day_cols: List[Tuple[int, int]],
+    staffs: List[Staff],
+    assignment: List[List[Optional[int]]],
+    rest_quota: int,
+    fixed: Dict[Tuple[int, int], str],
+):
+    if sheet_name in wb.sheetnames:
+        del wb[sheet_name]
+    ws = wb.copy_worksheet(template_ws)
+    ws.title = sheet_name
+    ws["C2"] = rest_quota
+
+    # 無効者は全休
+    for i, staff in enumerate(staffs):
+        row = 4 + i
+        if not staff.enabled:
+            for di, (c, _d) in enumerate(day_cols):
+                cell = ws.cell(row=row, column=c)
+                cell.value = "休"; cell.fill = FILL_GRAY; cell.font = FONT_BLACK
+
+    # 割り当て
+    for i, staff in enumerate(staffs):
+        row = 4 + i
+        if not staff.enabled:
+            continue
+        for di, (c, _d) in enumerate(day_cols):
+            cell = ws.cell(row=row, column=c)
+            key = (i, di)
+            if key in fixed:
+                raw = str(fixed[key]).strip()
+                kf = classify_token(raw)
+                if raw == "休" or kf == OFF:
+                    cell.value = "休"; cell.fill = FILL_GRAY; cell.font = FONT_RED; continue
+                if kf == PAID:
+                    cell.value = "有給"; cell.fill = FILL_GRAY; cell.font = FONT_RED_BOLD; continue
+                if kf == TRIP:
+                    cell.value = "出張"; cell.font = FONT_BLUE_BOLD; continue
+                if kf == EARLY:
+                    cell.value = "9"; cell.font = FONT_BLUE_BOLD; continue
+                if kf == LATE:
+                    cell.value = "11" if (month.dow[di] in (5,6) or month.holiday_like[di]) else "13"
+                    cell.font = FONT_BLACK; continue
+                cell.value = raw if raw != "" else None
+                continue
+
+            k = assignment[i][di]
+            if k is None:
+                cell.value = None
+            elif k == OFF:
+                cell.value = "休"; cell.fill = FILL_GRAY; cell.font = FONT_BLACK
+            elif k == PAID:
+                cell.value = "有給"; cell.fill = FILL_GRAY; cell.font = FONT_RED
+            elif k == TRIP:
+                cell.value = "出張"; cell.font = FONT_BLUE_BOLD
+            elif k == EARLY:
+                cell.value = "9"; cell.font = FONT_BLUE_BOLD
+            elif k == LATE:
+                cell.value = "11" if (month.dow[di] in (5,6) or month.holiday_like[di]) else "13"
+                cell.font = FONT_BLACK
+            elif k == REG:
+                cell.value = None
+
+    return ws
+
+# ===== 既存プランの x=1 位置を辞書化（距離計算用） =====
+def assignment_to_indicator_dict(assignment: List[List[Optional[int]]]) -> Dict[Tuple[int,int,int], int]:
+    indict = {}
+    for i, row in enumerate(assignment):
+        for d, k in enumerate(row):
+            if k is None:  # 念のため
+                continue
+            indict[(i, d, k)] = 1
+    return indict
+
+# ===== 実行ラッパ =====
+def generate_plans(in_path: str, out_path: str, n_plans: int, time_limit: int):
+    wb, ws_in, month, rest_quota, day_cols, staffs, fixed, carry_in = read_input(in_path)
+
+    debug_day_snapshot(month, staffs, fixed)
+    allhands_days = compute_allhands_days_user_only(month, staffs, fixed)
+
+    # ---- Plan_01：通常最適化で Z* を確定 ----
+    base = ShiftModel(month, staffs, rest_quota, fixed, carry_in, allhands_days)
+    base.add_base_constraints()
+    base.add_constraints_and_objective()
+
+    seed0 = random.randint(0, 10**6) if RANDOMIZE_SEED_EACH_PLAN else 5000
+    status, assignment, best_obj = base.solve(max_time=time_limit, random_seed=seed0)
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        print("[Solver] Infeasible at first optimization. Abort.")
+        return
+
+    write_plan_sheet(wb, ws_in, f"Plan_01", month, day_cols, staffs, assignment, rest_quota, fixed)
+    print(f"[Plan_01] Objective = {int(best_obj) if best_obj is not None else None}")
+
+    # 既存プラン群（距離用）
+    prev_plans = [assignment_to_indicator_dict(assignment)]
+
+    # ---- Plan_02 以降：Z==Z* 固定で距離最大化 ----
+    for k in range(2, n_plans + 1):
+        mdl = ShiftModel(month, staffs, rest_quota, fixed, carry_in, allhands_days)
+        mdl.add_base_constraints()
+        mdl.add_constraints_and_objective()  # ここで Z を作る
+        mdl.add_objective_diversify_with_fixed_cost(best_obj, prev_plans, min_delta=DIVERSITY_MIN_DELTA)
+
+        seedk = random.randint(0, 10**6) if RANDOMIZE_SEED_EACH_PLAN else (5000 + k)
+        status_k, assign_k, _ = mdl.solve(max_time=time_limit, random_seed=seedk)
+        if status_k not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            print(f"[Plan_{k:02d}] No diversified solution at fixed cost; trying without min_delta...")
+            # しきい値が厳しすぎる場合、下限を外して再トライ
+            mdl2 = ShiftModel(month, staffs, rest_quota, fixed, carry_in, allhands_days)
+            mdl2.add_base_constraints()
+            mdl2.add_constraints_and_objective()
+            mdl2.add_objective_diversify_with_fixed_cost(best_obj, prev_plans, min_delta=0)
+            status_k, assign_k, _ = mdl2.solve(max_time=time_limit, random_seed=seedk)
+
+        if status_k in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            write_plan_sheet(wb, ws_in, f"Plan_{k:02d}", month, day_cols, staffs, assign_k, rest_quota, fixed)
+            prev_plans.append(assignment_to_indicator_dict(assign_k))
+            print(f"[Plan_{k:02d}] Diversified solution found at same cost.")
+        else:
+            print(f"[Plan_{k:02d}] Failed to diversify at same cost. Skipped.")
+
+    wb.save(out_path)
+    print(f"[OK] Saved: {out_path}")
+
+def main():
+    parser = argparse.ArgumentParser(description="Shift generator (CP-SAT with optimal diversity)")
+    parser.add_argument("--in",  dest="in_path",  default=r"C:\Users\toufu\Desktop\shift\input.xlsx",
+                        help="Input Excel path")
+    parser.add_argument("--out", dest="out_path", default=r"C:\Users\toufu\Desktop\shift\output.xlsx",
+                        help="Output Excel path")
+    parser.add_argument("--plans", type=int, default=5, help="Number of plans")
+    parser.add_argument("--time_limit", type=int, default=15, help="Seconds per plan")
+    args = parser.parse_args()
+
+    generate_plans(args.in_path, args.out_path, args.plans, args.time_limit)
+
+if __name__ == "__main__":
+    main()
